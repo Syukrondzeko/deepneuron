@@ -1,0 +1,94 @@
+Testing Hello World Job:
+1. Create job.script
+$ nano job.script
+
+#!/bin/bash
+#SBATCH --job-name=MyJob
+#SBATCH --account=nq46
+#SBATCH --time=01:00:00
+#SBATCH --ntasks=1
+#SBATCH --mem-per-cpu=4096
+#SBATCH --cpus-per-task=1
+
+./helloworld
+
+2. Create the helloworld Executable 
+$ nano helloworld.c
+
+#include <stdio.h>
+
+int main() {
+    printf("Hello, World!\n");
+    return 0;
+}
+
+$ gcc -o helloworld helloworld.c
+
+3. Submit the job
+sbatch job.script
+
+4. See the job queue
+$ squeue -u `whoami`
+or
+$ show_job
+
+5. See the result
+cat slurm-<jobid>.out
+
+================================================================================
+
+Submit Webscrapper Job
+1. Create scraper.go
+$ nano scraper.go
+
+2. Check go module version in M3
+$ module avail go
+
+3. Load go module
+$ module load go/1.22.5
+$ go version
+
+4. Initialie go module
+$ go mod init parallel-webscraper
+
+5. Install gocolly
+$ go get github.com/gocolly/colly
+
+6. Build go program
+$ go build scraper.go
+
+7. Run the program for testing
+$ ./scraper https://en.wikipedia.org/wiki/Cristiano_Ronaldo
+
+8. Create a job script
+$ nano scraper_job.script
+
+#!/bin/bash
+#SBATCH --job-name=WebScraper
+#SBATCH --account=<your_account>        # Replace with your account name
+#SBATCH --ntasks=1                      # Number of tasks
+#SBATCH --time=01:00:00                 # Job time limit (1 hour)
+#SBATCH --mem-per-cpu=4096              # Memory per CPU core (4GB)
+#SBATCH --output=scraper_output.log     # Standard output log
+
+# Load Go module if necessary (you might have already loaded it, but ensure it's available)
+module load go/1.22.5
+
+# Run the Go web scraper
+./scraper https://en.wikipedia.org/wiki/Cristiano_Ronaldo
+
+9. Run the job
+$ sbatch scraper_job.script
+
+10. Show the job status
+$ show_job
+
+================================================================================
+Run Job Submitter
+python job_submitter.py -- https://en.wikipedia.org/wiki/Web_scraping
+
+%% This code will create a job script, deployed, and show the job status when finished
+
+python job_submitter_multijob.py "https://en.wikipedia.org/wiki/Wombat" "https://en.wikipedia.org/wiki/Koala" "https://en.wikipedia.org/wiki/Kangaroo" --max-workers 3
+
+%% This code will create a job script, deployed, and show the job status when finished. The different is, it can submit more than one job in parallel
