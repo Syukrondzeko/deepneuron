@@ -169,3 +169,19 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# macOS
+.DS_Store
+
+# Datasets, checkpoints and run artifacts
+data/
+checkpoints/
+*.pt
+*.pth
+lightning_logs/
+slurm-*.out
+
+# Web scraper build and outputs
+parallel-webscraper/wikipedia_scraper
+parallel-webscraper/output/
+parallel-webscraper/jobs/

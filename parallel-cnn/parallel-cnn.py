@@ -1,117 +1,109 @@
+"""Multi-GPU CIFAR-10 training with PyTorch DistributedDataParallel (one process per GPU).
+
+Based on the PyTorch DDP tutorial series:
+https://github.com/pytorch/examples/blob/main/distributed/ddp-tutorial-series/multigpu.py
+"""
+
+import argparse
+import os
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
-
+import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.utils.data.distributed import DistributedSampler
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
-import os
-import time
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
-class SimpleCNN(nn.Module):
-    def __init__(self):
-        super(SimpleCNN, self).__init__()
-        self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
-        self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
-        self.conv3 = nn.Conv2d(32, 64, 3, padding=1)
-        self.conv4 = nn.Conv2d(64, 128, 3, padding=1)
-        self.fc1 = nn.Linear(128*2*2, 512)
-        self.fc2 = nn.Linear(512, 256)
-        self.fc3 = nn.Linear(256, 10)
+from model import SimpleCNN, cifar10
 
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.max_pool2d(x, 2, 2)
-        x = F.relu(self.conv2(x))
-        x = F.max_pool2d(x, 2, 2)
-        x = F.relu(self.conv3(x))
-        x = F.max_pool2d(x, 2, 2)
-        x = F.relu(self.conv4(x))
-        x = F.max_pool2d(x, 2, 2)
-        x = x.view(-1, 128*2*2)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
 
-def ddp_setup(rank, world_size):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
-    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+def ddp_setup(rank: int, world_size: int):
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    os.environ.setdefault("MASTER_PORT", "12355")
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
-def load_train_objs():
-    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-    train_set = datasets.CIFAR10(root='/fs03/vf38/msyukron/data', train=True, download=True, transform=transform)
-    model = SimpleCNN()  
-    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
-    return train_set, model, optimizer
 
-def prepare_dataloader(dataset: datasets, batch_size: int):
+def prepare_dataloader(dataset, batch_size: int) -> DataLoader:
     return DataLoader(
         dataset,
         batch_size=batch_size,
         pin_memory=True,
-        shuffle=False,
-        sampler=DistributedSampler(dataset)
+        shuffle=False,  # DistributedSampler does the shuffling
+        sampler=DistributedSampler(dataset),
     )
 
+
 class Trainer:
-    def __init__(self, model: torch.nn.Module, train_data: DataLoader, optimizer: torch.optim.Optimizer, gpu_id: int, save_every: int) -> None:
+    def __init__(self, model, train_data: DataLoader, optimizer, gpu_id: int, save_every: int, ckpt_path: str):
         self.gpu_id = gpu_id
-        self.model = model.to(gpu_id)
         self.train_data = train_data
         self.optimizer = optimizer
         self.save_every = save_every
-        self.model = DDP(model, device_ids=[gpu_id])
+        self.ckpt_path = ckpt_path
+        self.model = DDP(model.to(gpu_id), device_ids=[gpu_id])
 
-    def _run_batch(self, source, targets):
+    def _run_batch(self, source, targets) -> float:
         self.optimizer.zero_grad()
-        output = self.model(source)
-        loss = F.cross_entropy(output, targets.squeeze().long())  # updated loss function
+        loss = F.cross_entropy(self.model(source), targets)
         loss.backward()
         self.optimizer.step()
+        return loss.item()
 
-    def _run_epoch(self, epoch):
-        b_sz = len(next(iter(self.train_data))[0])
-        print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}")
+    def _run_epoch(self, epoch: int):
         self.train_data.sampler.set_epoch(epoch)
+        total = 0.0
         for source, targets in self.train_data:
-            source = source.to(self.gpu_id)
-            targets = targets.to(self.gpu_id)
-            self._run_batch(source, targets)
+            total += self._run_batch(source.to(self.gpu_id), targets.to(self.gpu_id))
 
-    def _save_checkpoint(self, epoch):
-        ckp = self.model.module.state_dict()
-        PATH = "/fs03/vf38/msyukron/parallel-cnn.pt"
-        torch.save(ckp, PATH)
-        print(f"Epoch {epoch} | Training checkpoint saved at {PATH}")
+        # Average the epoch loss across all GPUs so rank 0 can report a global number.
+        loss = torch.tensor(total / len(self.train_data), device=self.gpu_id)
+        dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+        if self.gpu_id == 0:
+            print(f"Epoch {epoch + 1} | Steps/GPU: {len(self.train_data)} | Loss: {loss.item():.4f}")
+
+    def _save_checkpoint(self, epoch: int):
+        torch.save(self.model.module.state_dict(), self.ckpt_path)
+        print(f"Epoch {epoch + 1} | Training checkpoint saved at {self.ckpt_path}")
 
     def train(self, max_epochs: int):
         for epoch in range(max_epochs):
             self._run_epoch(epoch)
-            if self.gpu_id == 0 and epoch % self.save_every == 0:
+            is_save_epoch = (epoch + 1) % self.save_every == 0 or epoch + 1 == max_epochs
+            if self.gpu_id == 0 and is_save_epoch:
                 self._save_checkpoint(epoch)
 
-def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_size: int):
+
+def main(rank: int, world_size: int, args):
     ddp_setup(rank, world_size)
-    dataset, model, optimizer = load_train_objs()
-    train_data = prepare_dataloader(dataset, batch_size)
-    trainer = Trainer(model, train_data, optimizer, rank, save_every)
-    trainer.train(total_epochs)
-    destroy_process_group()
+    try:
+        dataset = cifar10(args.data_dir, download=False)  # downloaded once by the parent process
+        model = SimpleCNN()
+        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
+        trainer = Trainer(model, prepare_dataloader(dataset, args.batch_size), optimizer, rank,
+                          args.save_every, args.ckpt_path)
+        trainer.train(args.total_epochs)
+    finally:
+        dist.destroy_process_group()
+
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description='simple distributed training job')
-    parser.add_argument('total_epochs', type=int, help='Total epochs to train the model')
-    parser.add_argument('save_every', type=int, help='How often to save a snapshot')
-    parser.add_argument('--batch_size', default=32, type=int, help='Input batch size on each device (default: 32)')
+    parser = argparse.ArgumentParser(description="Distributed (multi-GPU) CIFAR-10 training")
+    parser.add_argument("total_epochs", type=int, help="Total epochs to train the model")
+    parser.add_argument("save_every", type=int, help="Save a checkpoint every N epochs")
+    parser.add_argument("--batch_size", default=32, type=int, help="Batch size per GPU (default: 32)")
+    parser.add_argument("--lr", default=1e-3, type=float, help="SGD learning rate (default: 1e-3)")
+    parser.add_argument("--data-dir", default="./data", help="Where CIFAR-10 is stored/downloaded")
+    parser.add_argument("--ckpt-path", default="./checkpoints/parallel-cnn.pt", help="Checkpoint file path")
     args = parser.parse_args()
-    
+
     world_size = torch.cuda.device_count()
-    mp.spawn(main, args=(world_size, args.save_every, args.total_epochs, args.batch_size), nprocs=world_size)
+    if world_size < 1:
+        raise SystemExit("No CUDA devices found; DDP training with NCCL needs at least one GPU.")
+
+    os.makedirs(os.path.dirname(args.ckpt_path) or ".", exist_ok=True)
+    # Download once here so the GPU workers don't race to write the same files.
+    cifar10(args.data_dir, download=True)
+
+    mp.spawn(main, args=(world_size, args), nprocs=world_size)
